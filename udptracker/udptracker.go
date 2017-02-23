@@ -75,8 +75,8 @@ func checkErr(err error) {
 	}
 }
 
-var Seeders = make(map[[20]byte]Peer)
-var Leechers = make(map[[20]byte]Peer)
+var Seeders = make(map[string]Peer)
+var Leechers = make(map[string]Peer)
 
 func handleRequest(conn *net.UDPConn) {
 	buf := bytes.NewBuffer(make([]byte, MaxRequestSize))
@@ -121,19 +121,20 @@ func handleAnnounce(conn *net.UDPConn, client *net.UDPAddr, header *RequestHeade
 	}
 	log.Println("Announce request from : ", peer)
 
+	peerID := string(req.PeerID[:])
 	switch Event(req.Event) {
 	case Started:
 		if req.Left > 0 {
-			Leechers[req.PeerID] = peer
+			Leechers[peerID] = peer
 		} else {
-			Seeders[req.PeerID] = peer
+			Seeders[peerID] = peer
 		}
 	case Completed:
-		delete(Seeders, req.PeerID)
-		Seeders[req.PeerID] = peer
+		delete(Seeders, peerID)
+		Seeders[peerID] = peer
 	case Stopped:
-		delete(Seeders, req.PeerID)
-		delete(Leechers, req.PeerID)
+		delete(Seeders, peerID)
+		delete(Leechers, peerID)
 	}
 
 	var response IPv4AnnounceResponseHeader

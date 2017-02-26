@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
 )
@@ -78,27 +79,37 @@ func checkErr(err error) {
 var Seeders = make(map[string]Peer)
 var Leechers = make(map[string]Peer)
 
-func handleRequest(conn *net.UDPConn) {
-	buf := bytes.NewBuffer(make([]byte, MaxRequestSize))
-	_, client, err := conn.ReadFromUDP(buf.Bytes())
-	if err != nil {
-		log.Println("Request : read from udp failed : ", err)
-		return
-	}
+type ResponseWriter struct {
+	conn *net.UDPConn
+	addr *net.UDPAddr
+}
 
+func (w ResponseWriter) Write(p []byte) (int, error) {
+	w.conn.WriteToUDP(p, w.addr)
+	return len(p), nil
+}
+
+type Request struct {
+	message []byte
+	ip      net.IP
+}
+
+func handleRequest(w io.Writer, req Request) {
 	var header RequestHeader
-	binary.Read(buf, binary.BigEndian, &header)
+	reader := bytes.NewReader(req.message)
+	binary.Read(reader, binary.BigEndian, &header)
+
 	fmt.Println(header)
 
 	switch Action(header.Action) {
 	case Connect:
-		handleConnect(conn, client, &header, buf)
+		handleConnect(w, req, &header)
 	case Announce:
-		handleAnnounce(conn, client, &header, buf)
+		handleAnnounce(w, req, &header)
 	}
 }
 
-func handleConnect(conn *net.UDPConn, client *net.UDPAddr, header *RequestHeader, buf *bytes.Buffer) {
+func handleConnect(w io.Writer, req Request, header *RequestHeader) {
 	if header.ConnectionID != ProtocolID {
 		log.Println("Request : wrong protocol id : ", header)
 		return
@@ -106,25 +117,24 @@ func handleConnect(conn *net.UDPConn, client *net.UDPAddr, header *RequestHeader
 
 	var response ConnectResponse
 	response.TransactionID = header.TransactionID
-	buf.Reset()
-	binary.Write(buf, binary.BigEndian, response)
-	conn.WriteToUDP(buf.Bytes(), client)
+	binary.Write(w, binary.BigEndian, response)
 }
 
-func handleAnnounce(conn *net.UDPConn, client *net.UDPAddr, header *RequestHeader, buf *bytes.Buffer) {
-	var req AnnounceRequest
-	binary.Read(buf, binary.BigEndian, &req)
+func handleAnnounce(w io.Writer, req Request, header *RequestHeader) {
+	announce := &AnnounceRequest{}
+	reader := bytes.NewReader(req.message[HeaderSize:])
+	binary.Read(reader, binary.BigEndian, announce)
 
-	peer := Peer{IPAddress: req.IPAddress, TCPPort: req.Port}
+	peer := Peer{IPAddress: announce.IPAddress, TCPPort: announce.Port}
 	if peer.IPAddress == 0 {
-		peer.IPAddress = binary.BigEndian.Uint32(client.IP.To4())
+		peer.IPAddress = binary.LittleEndian.Uint32(req.ip)
 	}
 	log.Println("Announce request from : ", peer)
 
-	peerID := string(req.PeerID[:])
-	switch Event(req.Event) {
+	peerID := string(announce.PeerID[:])
+	switch Event(announce.Event) {
 	case Started:
-		if req.Left > 0 {
+		if announce.Left > 0 {
 			Leechers[peerID] = peer
 		} else {
 			Seeders[peerID] = peer
@@ -137,6 +147,10 @@ func handleAnnounce(conn *net.UDPConn, client *net.UDPAddr, header *RequestHeade
 		delete(Leechers, peerID)
 	}
 
+	writeAnnounceResponse(w, header, announce)
+}
+
+func writeAnnounceResponse(w io.Writer, header *RequestHeader, announce *AnnounceRequest) {
 	var response IPv4AnnounceResponseHeader
 	response.Action = int32(Announce)
 	response.TransactionID = header.TransactionID
@@ -144,18 +158,18 @@ func handleAnnounce(conn *net.UDPConn, client *net.UDPAddr, header *RequestHeade
 	response.Leechers = int32(len(Leechers))
 	response.Seeders = int32(len(Seeders))
 
-	buf.Reset()
-	binary.Write(buf, binary.BigEndian, response)
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.BigEndian, response)
 
 	for _, peer := range Leechers {
-		binary.Write(buf, binary.BigEndian, peer)
+		binary.Write(&buf, binary.BigEndian, peer)
 	}
 
 	for _, peer := range Seeders {
-		binary.Write(buf, binary.BigEndian, peer)
+		binary.Write(&buf, binary.BigEndian, peer)
 	}
 
-	conn.WriteToUDP(buf.Bytes(), client)
+	w.Write(buf.Bytes())
 }
 
 func main() {
@@ -166,6 +180,15 @@ func main() {
 	checkErr(err)
 
 	for {
-		handleRequest(conn)
+		b := make([]byte, MaxRequestSize)
+		_, clientAddr, err := conn.ReadFromUDP(b)
+		if err != nil {
+			log.Println("Request : read from udp failed : ", err)
+			return
+		}
+		w := ResponseWriter{conn: conn, addr: clientAddr}
+
+		req := Request{ip: clientAddr.IP.To4(), message: b}
+		handleRequest(w, req)
 	}
 }
